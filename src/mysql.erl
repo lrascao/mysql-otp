@@ -746,6 +746,16 @@ handle_cast({init, Opts},
     TcpOpts = proplists:get_value(tcp_options, Opts, []),
     SockOpts = [binary, {packet, raw}, {active, false} | TcpOpts],
     {ok, Socket0} = SockMod0:connect(Host, Port, SockOpts),
+    
+    % do a optional random wait on start, on Aurora DB where connections
+    % are load balanced using weighted DNS we want to spread them out so
+    % they get evenly distributed across different read replicas
+    case proplists:get_value(wait_start, Opts, 0) of
+        {random, Min, Max} ->
+            timer:sleep(Min + rand:uniform((Max - Min)));
+        V ->
+            timer:sleep(V)
+    end,
 
     Database = proplists:get_value(database, Opts, undefined),
     SetFoundRows = proplists:get_value(found_rows, Opts, false),
