@@ -47,10 +47,9 @@
 
 failing_connect_test() ->
     process_flag(trap_exit, true),
-    ?assertMatch({error, {1045, <<"28000">>, <<"Access denied", _/binary>>}},
-                 mysql:start_link([{user, "dummy"}, {password, "junk"}])),
+    {ok, Pid} = mysql:start_link([{user, "dummy"}, {password, "junk"}]),
     receive
-        {'EXIT', _Pid, {1045, <<"28000">>, <<"Access denie", _/binary>>}} -> ok
+        {'EXIT', Pid, {1045, <<"28000">>, <<"Access denie", _/binary>>}} -> ok
     after 1000 ->
         error(no_exit_message)
     end,
