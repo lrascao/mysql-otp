@@ -473,14 +473,12 @@ init(Opts) ->
     Port           = proplists:get_value(port, Opts, ?default_port),
     User           = proplists:get_value(user, Opts, ?default_user),
     Password       = proplists:get_value(password, Opts, ?default_password),
-    Database       = proplists:get_value(database, Opts, undefined),
     LogWarn        = proplists:get_value(log_warnings, Opts, true),
     KeepAlive      = proplists:get_value(keep_alive, Opts, false),
     Timeout        = proplists:get_value(query_timeout, Opts,
                                          ?default_query_timeout),
     QueryCacheTime = proplists:get_value(query_cache_time, Opts,
                                          ?default_query_cache_time),
-    TcpOpts        = proplists:get_value(tcp_options, Opts, []),
     SetFoundRows   = proplists:get_value(found_rows, Opts, false),
     SSLOpts        = proplists:get_value(ssl, Opts, undefined),
     SockMod0       = mysql_sock_tcp,
@@ -491,36 +489,26 @@ init(Opts) ->
         N when N > 0 -> N
     end,
 
-    %% Connect socket
-    SockOpts = [binary, {packet, raw}, {active, false} | TcpOpts],
-    {ok, Socket0} = SockMod0:connect(Host, Port, SockOpts),
+    State0 = #state{server_version = undefined,
+                    connection_id = undefined,
+                    socket = undefined,
+                    sockmod = SockMod0,
+                    ssl_opts = SSLOpts,
+                    host = Host, port = Port, user = User,
+                    password = Password,
+                    log_warnings = LogWarn,
+                    ping_timeout = PingTimeout,
+                    query_timeout = Timeout,
+                    query_cache_time = QueryCacheTime,
+                    cap_found_rows = (SetFoundRows =:= true)},
+    %% Trap exit so that we can properly disconnect when we die.
+    process_flag(trap_exit, true),
+    State = schedule_ping(State0),
 
-    %% Exchange handshake communication.
-    Result = mysql_protocol:handshake(User, Password, Database, SockMod0, SSLOpts,
-                                      Socket0, SetFoundRows),
-    case Result of
-        {ok, Handshake, SockMod, Socket} ->
-            SockMod:setopts(Socket, [{active, once}]),
-            #handshake{server_version = Version, connection_id = ConnId,
-                       status = Status} = Handshake,
-            State = #state{server_version = Version, connection_id = ConnId,
-                           sockmod = SockMod,
-                           socket = Socket,
-                           ssl_opts = SSLOpts,
-                           host = Host, port = Port, user = User,
-                           password = Password, status = Status,
-                           log_warnings = LogWarn,
-                           ping_timeout = PingTimeout,
-                           query_timeout = Timeout,
-                           query_cache_time = QueryCacheTime,
-                           cap_found_rows = (SetFoundRows =:= true)},
-            %% Trap exit so that we can properly disconnect when we die.
-            process_flag(trap_exit, true),
-            State1 = schedule_ping(State),
-            {ok, State1};
-        #error{} = E ->
-            {stop, error_to_reason(E)}
-    end.
+    % Perform the actual initialization a bit later, now return to the caller,
+    % this means the worker is ready to handle requests
+    gen_server:cast(self(), {init, Opts}),
+    {ok, State}.
 
 %% @private
 %% @doc
@@ -747,6 +735,47 @@ handle_call(commit, _From, State = #state{socket = Socket, sockmod = SockMod,
     {reply, ok, State1#state{transaction_level = L - 1}}.
 
 %% @private
+handle_cast({init, Opts},
+            #state{host = Host,
+                   port = Port,
+                   user = User,
+                   password = Password,
+                   sockmod = SockMod0,
+                   ssl_opts = SSLOpts} = State) ->
+    %% Connect socket
+    TcpOpts = proplists:get_value(tcp_options, Opts, []),
+    SockOpts = [binary, {packet, raw}, {active, false} | TcpOpts],
+    {ok, Socket0} = SockMod0:connect(Host, Port, SockOpts),
+    
+    % do a optional random wait on start, on Aurora DB where connections
+    % are load balanced using weighted DNS we want to spread them out so
+    % they get evenly distributed across different read replicas
+    case proplists:get_value(wait_start, Opts, 0) of
+        {random, Min, Max} ->
+            timer:sleep(Min + rand:uniform((Max - Min)));
+        V ->
+            timer:sleep(V)
+    end,
+
+    Database = proplists:get_value(database, Opts, undefined),
+    SetFoundRows = proplists:get_value(found_rows, Opts, false),
+    %% Exchange handshake communication.
+    Result = mysql_protocol:handshake(User, Password, Database, SockMod0, SSLOpts,
+                                      Socket0, SetFoundRows),
+    case Result of
+        {ok, Handshake, SockMod, Socket} ->
+            SockMod:setopts(Socket, [{active, once}]),
+            #handshake{server_version = Version,
+                       connection_id = ConnId,
+                       status = Status} = Handshake,
+            {noreply, State#state{server_version = Version,
+                                  connection_id = ConnId,
+                                  socket = Socket,
+                                  status = Status,
+                                  sockmod = SockMod}};
+        #error{} = E ->
+            {stop, error_to_reason(E), State}
+    end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -945,8 +974,10 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
     end.
 
 stop_server(Reason,
-            #state{socket = Socket, connection_id = ConnId} = State) ->
+            #state{socket = Socket,
+                   connection_id = ConnId,
+                   sockmod = SockMod} = State) ->
   error_logger:error_msg("Connection Id ~p closing with reason: ~p~n",
                          [ConnId, Reason]),
-  ok = gen_tcp:close(Socket),
+  ok = SockMod:close(Socket),
   {stop, Reason, State#state{socket = undefined, connection_id = undefined}}.
