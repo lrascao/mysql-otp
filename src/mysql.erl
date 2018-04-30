@@ -466,7 +466,7 @@ encode(Conn, Term) ->
                 transaction_level = 0, ping_ref = undefined,
                 stmts = dict:new(), query_cache = empty, cap_found_rows = false,
                 reconnect_timeout, reconnect_ref = undefined,
-                database}).
+                database, kill_query_on_timeout}).
 
 %% @private
 init(Opts) ->
@@ -485,6 +485,7 @@ init(Opts) ->
     SSLOpts        = proplists:get_value(ssl, Opts, undefined),
     TcpOpts        = proplists:get_value(tcp_options, Opts, []),
     Database       = proplists:get_value(database, Opts, undefined),
+    KillQueryOnTimeout = proplists:get_value(kill_query_on_timeout, Opts, true),
     SockMod0       = mysql_sock_tcp,
 
     PingTimeout = case KeepAlive of
@@ -516,7 +517,8 @@ init(Opts) ->
                     query_cache_time = QueryCacheTime,
                     cap_found_rows = (SetFoundRows =:= true),
                     reconnect_timeout = ReconnectTimeout,
-                    database = Database},
+                    database = Database,
+                    kill_query_on_timeout = KillQueryOnTimeout},
     %% Trap exit so that we can properly disconnect when we die.
     process_flag(trap_exit, true),
     State = schedule_reconnect(
@@ -580,7 +582,7 @@ handle_call({query, Query, Timeout}, _From, State) ->
     SockMod:setopts(Socket, [{active, false}]),
     {ok, Recs} = case mysql_protocol:query(Query, SockMod, Socket, Timeout) of
         {error, timeout} when State#state.server_version >= [5, 0, 0] ->
-            kill_query(State),
+            maybe_kill_query(State),
             mysql_protocol:fetch_query_response(SockMod, Socket, ?cmd_timeout);
         {error, timeout} ->
             %% For MySQL 4.x.x there is no way to recover from timeout except
@@ -850,7 +852,7 @@ execute_stmt(Stmt, Args, Timeout, State = #state{socket = Socket, sockmod = Sock
     {ok, Recs} = case mysql_protocol:execute(Stmt, Args, SockMod, Socket,
                                              Timeout) of
         {error, timeout} when State#state.server_version >= [5, 0, 0] ->
-            kill_query(State),
+            maybe_kill_query(State),
             mysql_protocol:fetch_execute_response(SockMod, Socket,
                                                   ?cmd_timeout);
         {error, timeout} ->
@@ -989,11 +991,12 @@ log_warnings(#state{socket = Socket, sockmod = SockMod} = State, Query) ->
              || [Level, Code, Message] <- Rows],
     error_logger:warning_msg("~s in ~s~n", [Lines, Query]).
 
-%% @doc Makes a separate connection and execute KILL QUERY. We do this to get
+%% @doc Optionally creates a separate connection and execute KILL QUERY. We do this to get
 %% our main connection back to normal. KILL QUERY appeared in MySQL 5.0.0.
-kill_query(#state{connection_id = ConnId, host = Host, port = Port,
-                  user = User, password = Password, ssl_opts = SSLOpts,
-                  cap_found_rows = SetFoundRows}) ->
+maybe_kill_query(#state{kill_query_on_timeout = false}) -> ok;
+maybe_kill_query(#state{connection_id = ConnId, host = Host, port = Port,
+                        user = User, password = Password, ssl_opts = SSLOpts,
+                        cap_found_rows = SetFoundRows}) ->
     %% Connect socket
     SockOpts = [{active, false}, binary, {packet, raw}],
     {ok, Socket0} = mysql_sock_tcp:connect(Host, Port, SockOpts),
