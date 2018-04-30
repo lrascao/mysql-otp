@@ -458,13 +458,15 @@ encode(Conn, Term) ->
 -include("server_status.hrl").
 
 %% Gen_server state
--record(state, {server_version, connection_id, socket, sockmod, ssl_opts,
+-record(state, {server_version, connection_id, socket, sockmod, tcp_opts, ssl_opts,
                 host, port, user, password, log_warnings,
                 ping_timeout,
                 query_timeout, query_cache_time,
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_level = 0, ping_ref = undefined,
-                stmts = dict:new(), query_cache = empty, cap_found_rows = false}).
+                stmts = dict:new(), query_cache = empty, cap_found_rows = false,
+                reconnect_timeout, reconnect_ref = undefined,
+                database}).
 
 %% @private
 init(Opts) ->
@@ -481,6 +483,8 @@ init(Opts) ->
                                          ?default_query_cache_time),
     SetFoundRows   = proplists:get_value(found_rows, Opts, false),
     SSLOpts        = proplists:get_value(ssl, Opts, undefined),
+    TcpOpts        = proplists:get_value(tcp_options, Opts, []),
+    Database       = proplists:get_value(database, Opts, undefined),
     SockMod0       = mysql_sock_tcp,
 
     PingTimeout = case KeepAlive of
@@ -489,10 +493,20 @@ init(Opts) ->
         N when N > 0 -> N
     end,
 
+    % optionally start a periodic timer that will reconnect to the database,
+    % we want this because when using auto-scaled Aurora replicas
+    % we need the nodes to see the new replicas that come online.
+    ReconnectTimeout =
+        case proplists:get_value(periodic_reconnect, Opts, undefined) of
+            undefined -> infinity;
+            T when is_integer(T) andalso T > 0 -> T
+        end,
+
     State0 = #state{server_version = undefined,
                     connection_id = undefined,
                     socket = undefined,
                     sockmod = SockMod0,
+                    tcp_opts = TcpOpts,
                     ssl_opts = SSLOpts,
                     host = Host, port = Port, user = User,
                     password = Password,
@@ -500,10 +514,13 @@ init(Opts) ->
                     ping_timeout = PingTimeout,
                     query_timeout = Timeout,
                     query_cache_time = QueryCacheTime,
-                    cap_found_rows = (SetFoundRows =:= true)},
+                    cap_found_rows = (SetFoundRows =:= true),
+                    reconnect_timeout = ReconnectTimeout,
+                    database = Database},
     %% Trap exit so that we can properly disconnect when we die.
     process_flag(trap_exit, true),
-    State = schedule_ping(State0),
+    State = schedule_reconnect(
+              schedule_ping(State0)),
 
     % Perform the actual initialization a bit later, now return to the caller,
     % this means the worker is ready to handle requests
@@ -735,46 +752,22 @@ handle_call(commit, _From, State = #state{socket = Socket, sockmod = SockMod,
     {reply, ok, State1#state{transaction_level = L - 1}}.
 
 %% @private
-handle_cast({init, Opts},
-            #state{host = Host,
-                   port = Port,
-                   user = User,
-                   password = Password,
-                   sockmod = SockMod0,
-                   ssl_opts = SSLOpts} = State) ->
-    %% Connect socket
-    TcpOpts = proplists:get_value(tcp_options, Opts, []),
-    SockOpts = [binary, {packet, raw}, {active, false} | TcpOpts],
-    {ok, Socket0} = SockMod0:connect(Host, Port, SockOpts),
-    
-    % do a optional random wait on start, on Aurora DB where connections
-    % are load balanced using weighted DNS we want to spread them out so
-    % they get evenly distributed across different read replicas
-    case proplists:get_value(wait_start, Opts, 0) of
-        {random, Min, Max} ->
-            timer:sleep(Min + rand:uniform((Max - Min)));
-        V ->
-            timer:sleep(V)
-    end,
+handle_cast({init, Opts}, State0) ->
+    case connect(State0) of
+        {error, Reason} ->
+            {stop, Reason, State0};
+        #state{} = State ->
+            % do a optional random wait on start, on Aurora DB where connections
+            % are load balanced using weighted DNS we want to spread them out so
+            % they get evenly distributed across different read replicas
+            case proplists:get_value(wait_start, Opts, 0) of
+                {random, Min, Max} ->
+                    timer:sleep(Min + rand:uniform((Max - Min)));
+                V ->
+                    timer:sleep(V)
+            end,
 
-    Database = proplists:get_value(database, Opts, undefined),
-    SetFoundRows = proplists:get_value(found_rows, Opts, false),
-    %% Exchange handshake communication.
-    Result = mysql_protocol:handshake(User, Password, Database, SockMod0, SSLOpts,
-                                      Socket0, SetFoundRows),
-    case Result of
-        {ok, Handshake, SockMod, Socket} ->
-            SockMod:setopts(Socket, [{active, once}]),
-            #handshake{server_version = Version,
-                       connection_id = ConnId,
-                       status = Status} = Handshake,
-            {noreply, State#state{server_version = Version,
-                                  connection_id = ConnId,
-                                  socket = Socket,
-                                  status = Status,
-                                  sockmod = SockMod}};
-        #error{} = E ->
-            {stop, error_to_reason(E), State}
+            {noreply, State}
     end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -797,6 +790,14 @@ handle_info(query_cache, #state{query_cache = Cache,
     mysql_cache:size(Cache1) > 0 andalso
         erlang:send_after(CacheTime, self(), query_cache),
     {noreply, State#state{query_cache = Cache1}};
+handle_info(reconnect, State0) ->
+    Chance = application:get_env(mysql, reconnect_chance, 50), 
+    case rand:uniform(100) of
+        D when D < Chance ->
+            {stop, normal, State0};
+        _ ->
+            {noreply, schedule_reconnect(State0)}
+    end;
 handle_info(ping, #state{socket = Socket, sockmod = SockMod} = State) ->
     SockMod:setopts(Socket, [{active, false}]),
     SockMod = State#state.sockmod,
@@ -929,6 +930,45 @@ schedule_ping(State = #state{ping_timeout = infinity}) ->
 schedule_ping(State = #state{ping_timeout = Timeout, ping_ref = Ref}) ->
     is_reference(Ref) andalso erlang:cancel_timer(Ref),
     State#state{ping_ref = erlang:send_after(Timeout, self(), ping)}.
+
+%% @doc Schedules (or re-schedules) SQL reconnection.
+schedule_reconnect(State = #state{reconnect_timeout = infinity}) ->
+    State;
+schedule_reconnect(#state{reconnect_timeout = Timeout,
+                          reconnect_ref = Ref} = State) ->
+    is_reference(Ref) andalso erlang:cancel_timer(Ref),
+    State#state{reconnect_ref = erlang:send_after(Timeout, self(), reconnect)}.
+
+%% @doc Connects to MySQL endpoint
+connect(#state{host = Host,
+               port = Port,
+               user = User,
+               password = Password,
+               database = Database,
+               cap_found_rows = SetFoundRows,
+               tcp_opts = TcpOpts,
+               ssl_opts = SSLOpts,
+               sockmod = SockMod0} = State) ->
+    %% Connect socket
+    SockOpts = [binary, {packet, raw}, {active, false} | TcpOpts],
+    {ok, Socket0} = SockMod0:connect(Host, Port, SockOpts),
+    
+    %% Exchange handshake communication.
+    case mysql_protocol:handshake(User, Password, Database, SockMod0, SSLOpts,
+                                  Socket0, SetFoundRows) of
+        {ok, Handshake, SockMod, Socket} ->
+            SockMod:setopts(Socket, [{active, once}]),
+            #handshake{server_version = Version,
+                       connection_id = ConnId,
+                       status = Status} = Handshake,
+            State#state{server_version = Version,
+                        connection_id = ConnId,
+                        socket = Socket,
+                        status = Status,
+                        sockmod = SockMod};
+        #error{} = E ->
+            {error, error_to_reason(E)}
+    end.
 
 %% @doc Since errors don't return a status but some errors cause an implicit
 %% rollback, we use this function to clear fix the transaction bit in the
