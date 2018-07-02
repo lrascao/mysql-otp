@@ -154,22 +154,27 @@ start_link(Options) ->
     end,
     case Ret of
         {ok, Pid} ->
-            %% Initial queries
-            Queries = proplists:get_value(queries, Options, []),
-            lists:foreach(fun (Query) ->
-                              case mysql:query(Pid, Query) of
-                                  ok -> ok;
-                                  {ok, _, _} -> ok;
-                                  {ok, _} -> ok
-                              end
-                          end,
-                          Queries),
-            %% Prepare
-            Prepare = proplists:get_value(prepare, Options, []),
-            lists:foreach(fun ({Name, Stmt}) ->
-                              {ok, Name} = mysql:prepare(Pid, Name, Stmt)
-                          end,
-                          Prepare);
+            %% Initial queries, spawn a process that does since we don't really
+            %% case about the result. We do this because if you start enough workers
+            %% in the pool it will lead to timeout when starting since all workers will
+            %% serialize their init execution through these queries
+            spawn(fun() ->
+                    Queries = proplists:get_value(queries, Options, []),
+                    lists:foreach(fun (Query) ->
+                                      case mysql:query(Pid, Query) of
+                                          ok -> ok;
+                                          {ok, _, _} -> ok;
+                                          {ok, _} -> ok
+                                      end
+                                  end,
+                                  Queries),
+                    %% Prepare
+                    Prepare = proplists:get_value(prepare, Options, []),
+                    lists:foreach(fun ({Name, Stmt}) ->
+                                      {ok, Name} = mysql:prepare(Pid, Name, Stmt)
+                                  end,
+                                  Prepare)
+                  end);
         _ -> ok
     end,
     Ret.
