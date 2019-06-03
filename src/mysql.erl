@@ -394,7 +394,7 @@ transaction(Conn, Fun, Args, Retries) when is_list(Args),
             ok = gen_server:call(Conn, commit),
             {atomic, ResultOfFun}
     catch
-        throw:{implicit_rollback, N, Reason} when N >= 1 ->
+        throw:{implicit_rollback, N, Reason}:Stacktrace when N >= 1 ->
             %% Jump out of N nested transactions to restart the outer-most one.
             %% The server has already rollbacked so we shouldn't do that here.
             case N of
@@ -411,29 +411,29 @@ transaction(Conn, Fun, Args, Retries) when is_list(Args),
                             %% seem to have fully rollbacked and an extra
                             %% rollback doesn't hurt.
                             ok = query(Conn, <<"ROLLBACK">>),
-                            {aborted, {Reason, erlang:get_stacktrace()}}
+                            {aborted, {Reason, Stacktrace}}
                     end;
                 _ ->
                     %% Re-throw with the same trace. We'll use that in the
                     %% final {aborted, {Reason, Trace}} in the outer level.
                     erlang:raise(throw, {implicit_rollback, N - 1, Reason},
-                                 erlang:get_stacktrace())
+                                 Stacktrace)
             end;
-        error:{implicit_commit, _Query} = E ->
+        error:{implicit_commit, Query}:Stacktrace ->
             %% The called did something like ALTER TABLE which resulted in an
             %% implicit commit. The server has already committed. We need to
             %% jump out of N levels of transactions.
             %%
             %% Returning 'atomic' or 'aborted' would both be wrong. Raise an
             %% exception is the best we can do.
-            erlang:raise(error, E, erlang:get_stacktrace());
-        Class:Reason ->
+            erlang:raise(error, {implicit_commit, Query}, Stacktrace);
+        Class:Reason:Stacktrace ->
             %% We must be able to rollback. Otherwise let's crash.
             ok = gen_server:call(Conn, rollback),
             %% These forms for throw, error and exit mirror Mnesia's behaviour.
             Aborted = case Class of
                 throw -> {throw, Reason};
-                error -> {Reason, erlang:get_stacktrace()};
+                error -> {Reason, Stacktrace};
                 exit  -> Reason
             end,
             {aborted, Aborted}
